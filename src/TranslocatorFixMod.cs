@@ -3,7 +3,7 @@ using System.Text;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
 
-namespace FixTL
+namespace lionfox_fixtl
 {
     public class TranslocatorFixMod : ModSystem
     {
@@ -68,7 +68,7 @@ namespace FixTL
                     player.Entity.Teleporting = false;
                     cleared++;
                     detail.AppendLine($"  cleared: {player.PlayerName} (eid {player.Entity.EntityId})");
-                    sapi.Logger.Notification($"[FixTL] Cleared stuck Teleporting flag on {player.PlayerName} (eid {player.Entity.EntityId}) via /fixtl all from {args.Caller.GetName()}.");
+                    sapi.Logger.Notification($"[lionfox_fixtl] Cleared stuck Teleporting flag on {player.PlayerName} (eid {player.Entity.EntityId}) via /fixtl all from {args.Caller.GetName()}.");
                 }
             }
 
@@ -119,7 +119,7 @@ namespace FixTL
             if (!player.Entity.Teleporting) return null;
 
             player.Entity.Teleporting = false;
-            sapi.Logger.Notification($"[FixTL] Cleared stuck Teleporting flag on {player.PlayerName} (eid {player.Entity.EntityId}) via /fixtl ({source}).");
+            sapi.Logger.Notification($"[lionfox_fixtl] Cleared stuck Teleporting flag on {player.PlayerName} (eid {player.Entity.EntityId}) via /fixtl ({source}).");
             return TextCommandResult.Success($"Cleared stuck Teleporting flag on {player.PlayerName}. Try a translocator now.");
         }
     }

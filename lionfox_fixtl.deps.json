@@ -6,15 +6,15 @@
   "compilationOptions": {},
   "targets": {
     ".NETCoreApp,Version=v8.0": {
-      "FixTL/1.0.0": {
+      "lionfox_fixtl/1.0.0": {
         "runtime": {
-          "FixTL.dll": {}
+          "lionfox_fixtl.dll": {}
         }
       }
     }
   },
   "libraries": {
-    "FixTL/1.0.0": {
+    "lionfox_fixtl/1.0.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""
