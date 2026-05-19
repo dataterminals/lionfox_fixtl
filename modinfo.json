@@ -1,0 +1,12 @@
+{
+    "type": "code",
+    "modid": "fixtl",
+    "name": "FixTL",
+    "description": "Adds /fixtl — clears the vanilla Entity.Teleporting flag when it gets stuck true on a player entity. Vanilla BlockEntityTeleporterBase.HandleTeleportingServer silently skips any entity with this flag set (continue;), which manifests as 'translocator particles play but no teleport.' Flag is only cleared inside the chunk-load OnLoaded callback of TeleportToDouble, so if that callback never resolves, the flag leaks until relog.",
+    "authors": [ "lionfox" ],
+    "version": "1.0.0",
+    "side": "Server",
+    "dependencies": {
+        "game": "1.20.0"
+    }
+}
