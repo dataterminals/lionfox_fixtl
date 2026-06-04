@@ -41,6 +41,11 @@ namespace lionfox_fixtl
                     .RequiresPrivilege(Privilege.chat)
                     .HandleWith(UnstickSelf)
                 .EndSubCommand()
+                .BeginSubCommand("go")
+                    .WithDescription("Bypass the teleporter's HandleTeleportingServer loop entirely: find the translocator pad you're standing on, read its tpLocation, and TeleportToDouble there directly. Workaround when warmup runs but the server-side loop never actually fires the teleport.")
+                    .RequiresPrivilege(Privilege.chat)
+                    .HandleWith(GoSelf)
+                .EndSubCommand()
                 .BeginSubCommand("all")
                     .WithDescription("Clear the stuck Teleporting flag on every online player.")
                     .RequiresPrivilege(Privilege.controlserver)
@@ -163,6 +168,8 @@ namespace lionfox_fixtl
 
             sb.AppendLine($"GameMode          : {player.WorldData?.CurrentGameMode}");
             sb.AppendLine($"NoClip (controls) : {SafeNoClip(e)}");
+            var cb = e.CollisionBox;
+            sb.AppendLine($"CollisionBox      : ({cb?.X1:F2},{cb?.Y1:F2},{cb?.Z1:F2}) -> ({cb?.X2:F2},{cb?.Y2:F2},{cb?.Z2:F2})  size {(cb?.X2 - cb?.X1):F2}x{(cb?.Y2 - cb?.Y1):F2}x{(cb?.Z2 - cb?.Z1):F2}");
 
             int nearbyBe = 0;
             int containsSelf = 0;
@@ -198,7 +205,11 @@ namespace lionfox_fixtl
             sb.AppendLine($"Nearby teleporter BEs (r=6): {nearbyBe}, containing self: {containsSelf}");
             if (nearbyBe > 0) sb.Append(beDetail.ToString().TrimEnd());
 
-            return TextCommandResult.Success(sb.ToString().TrimEnd());
+            string report = sb.ToString().TrimEnd();
+            // Mirror to server log so it can't be lost to chat scrollback/truncation.
+            foreach (var line in report.Split('\n'))
+                sapi.Logger.Notification("[lionfox_fixtl] " + line.TrimEnd('\r'));
+            return TextCommandResult.Success(report + "\n(Full report also written to server log.)");
         }
 
         // --- unstick ------------------------------------------------------------
@@ -218,13 +229,14 @@ namespace lionfox_fixtl
                 actions.Add("cleared Teleporting=true");
             }
 
-            if (TryWriteField(e, "ignoreTeleportCall", false, out bool wasStuckTrue))
+            var priorIgnore = TryReadField<bool>(e, "ignoreTeleportCall", out bool ignoreReadable);
+            if (TryWriteField(e, "ignoreTeleportCall", false, out _))
             {
-                if (wasStuckTrue) actions.Add("cleared ignoreTeleportCall=true");
+                actions.Add($"ignoreTeleportCall: prior={(ignoreReadable ? priorIgnore.ToString() : "?")} -> false");
             }
             else
             {
-                actions.Add("<could not access ignoreTeleportCall>");
+                actions.Add("ignoreTeleportCall: <field not writable>");
             }
 
             double x = e.ServerPos.X, y = e.ServerPos.Y, z = e.ServerPos.Z;
@@ -241,6 +253,81 @@ namespace lionfox_fixtl
             string summary = string.Join("; ", actions);
             sapi.Logger.Notification($"[lionfox_fixtl] /fixtl unstick for {player.PlayerName} (eid {e.EntityId}): {summary}");
             return TextCommandResult.Success($"Force-resync done: {summary}\nIf you still can't translocate, step off the pad and back on.");
+        }
+
+        // --- go: bypass HandleTeleportingServer by teleporting straight to the pad's target
+
+        TextCommandResult GoSelf(TextCommandCallingArgs args)
+        {
+            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
+            if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
+                return TextCommandResult.Error("No player entity to inspect.");
+
+            var e = player.Entity;
+            BlockEntity? pad = null;
+            double padDist = double.MaxValue;
+            foreach (var (be, dist) in NearbyTeleporterBEs(e, radius: 2))
+            {
+                if (dist < padDist) { pad = be; padDist = dist; }
+            }
+            if (pad == null) return TextCommandResult.Error("No translocator pad within 2 blocks. Stand on one and try again.");
+
+            // Resolve destination. Prefer calling GetTarget(entity) on the actual subclass
+            // (e.g. BlockEntityStaticTranslocator returns tpLocation + (-0.3, 1, -0.3)).
+            Vec3d? target = null;
+            string targetSource;
+            try
+            {
+                var getTarget = pad.GetType().GetMethod("GetTarget", new[] { typeof(Entity) });
+                if (getTarget != null)
+                {
+                    target = getTarget.Invoke(pad, new object[] { e }) as Vec3d;
+                    targetSource = "GetTarget(entity)";
+                }
+                else
+                {
+                    targetSource = "<GetTarget missing>";
+                }
+            }
+            catch (Exception ex)
+            {
+                targetSource = $"<GetTarget threw {ex.GetType().Name}>";
+            }
+
+            if (target == null)
+            {
+                // Fallback: read tpLocation field directly.
+                var tpLoc = TryReadField<BlockPos>(pad, "tpLocation", out bool tpOk);
+                if (tpOk && tpLoc != null)
+                {
+                    target = new Vec3d(tpLoc.X - 0.3, tpLoc.Y + 1.0, tpLoc.Z - 0.3);
+                    targetSource = "tpLocation field";
+                }
+            }
+
+            if (target == null)
+                return TextCommandResult.Error($"Pad {pad.GetType().Name} @ {pad.Pos} has no resolvable destination (source: {targetSource}). Pair may not have been discovered yet.");
+
+            // Apply offset if the BE uses pad-relative target coords.
+            var isOffset = TryReadField<bool>(pad, "tpLocationIsOffset", out bool _);
+            if (isOffset) target = target.Clone().Add(pad.Pos.X, pad.Pos.Y, pad.Pos.Z);
+
+            // Defensive: clear ignoreTeleportCall so TeleportToDouble actually runs.
+            TryWriteField(e, "ignoreTeleportCall", false, out _);
+            e.Teleporting = false;
+
+            try
+            {
+                e.TeleportToDouble(target.X, target.Y, target.Z);
+            }
+            catch (Exception ex)
+            {
+                sapi.Logger.Error($"[lionfox_fixtl] /fixtl go TeleportToDouble threw for {player.PlayerName}: {ex}");
+                return TextCommandResult.Error($"TeleportToDouble threw: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            sapi.Logger.Notification($"[lionfox_fixtl] /fixtl go for {player.PlayerName} (eid {e.EntityId}): pad {pad.GetType().Name} @ {pad.Pos} -> ({target.X:F2},{target.Y:F2},{target.Z:F2}) via {targetSource}");
+            return TextCommandResult.Success($"Bypassed BE loop: teleported to ({target.X:F2}, {target.Y:F2}, {target.Z:F2}) via {targetSource} on {pad.GetType().Name}.");
         }
 
         // --- reflection helpers -------------------------------------------------

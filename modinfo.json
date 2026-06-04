@@ -2,9 +2,9 @@
     "type": "code",
     "modid": "lionfoxfixtl",
     "name": "lionfox_fixtl",
-    "description": "Adds /fixtl for recovering players stuck mid-translocate. /fixtl clears the Entity.Teleporting flag (vanilla BlockEntityTeleporterBase.HandleTeleportingServer silently skips entities with the flag set, which manifests as 'translocator particles play but no teleport'). /fixtl unstick additionally clears EntityPlayer.ignoreTeleportCall (via reflection) and re-broadcasts position via TeleportToDouble — fixes the variant where warmup runs to completion but the player doesn't visually move after switching gamemodes (e.g. through spectator). /fixtl diag dumps Teleporting/IsTeleport flags, Pos vs ServerPos delta, MountedOn, ignoreTeleportCall, NoClip, and nearby teleporter BEs' tpingEntities entries. Admin subcommands: /fixtl status, /fixtl all, /fixtl player <name>.",
+    "description": "Adds /fixtl for recovering players stuck mid-translocate. /fixtl clears the Entity.Teleporting flag. /fixtl unstick additionally clears EntityPlayer.ignoreTeleportCall (via reflection) and re-broadcasts ServerPos. /fixtl go bypasses BlockEntityTeleporterBase.HandleTeleportingServer entirely — finds the pad you're standing on, resolves its destination via GetTarget/tpLocation, and TeleportToDoubles you there directly (workaround for the gamemode-shift case where warmup runs but the BE loop never actually fires the teleport). /fixtl diag dumps Teleporting/IsTeleport, Pos vs ServerPos delta, MountedOn, ignoreTeleportCall, NoClip, CollisionBox, GameMode, and nearby teleporter BEs' tpingEntities entries — full report mirrored to the server log. Admin subcommands: /fixtl status, /fixtl all, /fixtl player <name>.",
     "authors": [ "lionfox" ],
-    "version": "1.1.0",
+    "version": "1.1.1",
     "side": "Server",
     "dependencies": {
         "game": "1.21.6"
