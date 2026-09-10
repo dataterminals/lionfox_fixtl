@@ -32,12 +32,12 @@ namespace lionfox_fixtl
                     .HandleWith(Status)
                 .EndSubCommand()
                 .BeginSubCommand("diag")
-                    .WithDescription("Dump translocator-relevant state for the caller: Teleporting/IsTeleport flags, Pos vs ServerPos delta, MountedOn, ignoreTeleportCall (reflected), NoClip, and nearby teleporter block entities' tpingEntities entries.")
+                    .WithDescription("Dump translocator-relevant state for the caller: Teleporting/IsTeleport flags, Pos and PreviousServerPos with the movement delta between them, MountedOn, ignoreTeleportCall (reflected), NoClip, and nearby teleporter block entities' tpingEntities entries.")
                     .RequiresPrivilege(Privilege.chat)
                     .HandleWith(Diag)
                 .EndSubCommand()
                 .BeginSubCommand("unstick")
-                    .WithDescription("Force-resync the caller: clears Teleporting + ignoreTeleportCall (via reflection) and re-runs TeleportToDouble to the entity's current ServerPos so clients snap. Use when warmup completed but you didn't actually move.")
+                    .WithDescription("Force-resync the caller: clears Teleporting + ignoreTeleportCall (via reflection) and re-runs TeleportToDouble to the entity's current Pos so clients snap. Use when warmup completed but you didn't actually move.")
                     .RequiresPrivilege(Privilege.chat)
                     .HandleWith(UnstickSelf)
                 .EndSubCommand()
@@ -57,6 +57,11 @@ namespace lionfox_fixtl
                     .WithArgs(sapi.ChatCommands.Parsers.Word("playername"))
                     .HandleWith(FixNamed)
                 .EndSubCommand();
+
+            // Deferred to RunGame: the GameContent types this checks for live in
+            // VSSurvivalMod, so checking during StartServerSide could report them
+            // missing purely because that mod has not been started yet.
+            sapi.Event.ServerRunPhase(EnumServerRunPhase.RunGame, () => SelfCheck(sapi));
         }
 
         TextCommandResult FixSelf(TextCommandCallingArgs args)
@@ -155,12 +160,22 @@ namespace lionfox_fixtl
             sb.AppendLine($"IsTeleport        : {e.IsTeleport}");
             sb.AppendLine($"MountedOn         : {(e.MountedOn?.Entity?.GetType().Name ?? "<none>")}");
             sb.AppendLine($"Pos               : {e.Pos.X:F2}, {e.Pos.Y:F2}, {e.Pos.Z:F2}");
-            sb.AppendLine($"ServerPos         : {e.ServerPos.X:F2}, {e.ServerPos.Y:F2}, {e.ServerPos.Z:F2}");
-            double dx = e.Pos.X - e.ServerPos.X;
-            double dy = e.Pos.Y - e.ServerPos.Y;
-            double dz = e.Pos.Z - e.ServerPos.Z;
-            sb.AppendLine($"|Pos-ServerPos|   : {Math.Sqrt(dx * dx + dy * dy + dz * dz):F2} blocks");
+            // The old "ServerPos" line and the |Pos-ServerPos| delta are GONE, not
+            // ported. On 1.22 Entity.ServerPos and Entity.SidedPos are both obsolete
+            // shims marked "Use Pos instead" - the three have been collapsed onto one
+            // property. Printing ServerPos would restate Pos, and the delta would be a
+            // hard 0.00 every single time.
+            //
+            // That is worse than removing it. This is a diagnostic somebody reads while
+            // a player is stuck in a translocator, and a field that always reads 0.00
+            // looks like PROOF the position is synced rather than proof the measurement
+            // is dead. PreviousServerPos is NOT obsolete and is still a distinct value,
+            // so the movement-since-last-tick delta below carries real information.
             sb.AppendLine($"PreviousServerPos : {e.PreviousServerPos.X:F2}, {e.PreviousServerPos.Y:F2}, {e.PreviousServerPos.Z:F2}");
+            double dx = e.Pos.X - e.PreviousServerPos.X;
+            double dy = e.Pos.Y - e.PreviousServerPos.Y;
+            double dz = e.Pos.Z - e.PreviousServerPos.Z;
+            sb.AppendLine($"|Pos-PrevServer|  : {Math.Sqrt(dx * dx + dy * dy + dz * dz):F2} blocks (movement since last sync)");
             sb.AppendLine($"Motion            : {e.Pos.Motion.X:F3}, {e.Pos.Motion.Y:F3}, {e.Pos.Motion.Z:F3}");
 
             var ignoreVal = TryReadField<bool>(e, "ignoreTeleportCall", out bool ignoreOk);
@@ -239,7 +254,9 @@ namespace lionfox_fixtl
                 actions.Add("ignoreTeleportCall: <field not writable>");
             }
 
-            double x = e.ServerPos.X, y = e.ServerPos.Y, z = e.ServerPos.Z;
+            // Was e.ServerPos - obsolete on 1.22 ("Use Pos instead"), and Pos IS the
+            // authoritative server-side position here, so the semantics are unchanged.
+            double x = e.Pos.X, y = e.Pos.Y, z = e.Pos.Z;
             try
             {
                 e.TeleportToDouble(x, y, z);
@@ -330,6 +347,114 @@ namespace lionfox_fixtl
             return TextCommandResult.Success($"Bypassed BE loop: teleported to ({target.X:F2}, {target.Y:F2}, {target.Z:F2}) via {targetSource} on {pad.GetType().Name}.");
         }
 
+        // --- startup self-check -------------------------------------------------
+
+        // WHY THIS EXISTS. Every reflective lookup below is individually guarded and
+        // degrades to a placeholder string rather than throwing: "<field not found>",
+        // "<GetTarget missing>", "<tpingEntities unreadable>". That is the right
+        // behaviour for a recovery command - but it means a renamed member produces a
+        // mod that loads clean, reports healthy, and silently fixes nobody. The first
+        // evidence would be a player stuck in a translocator who cannot be unstuck,
+        // which is the worst possible moment to discover it.
+        //
+        // So resolve everything once, up front, and say so loudly. This does not fix a
+        // break; it makes the break arrive as a log line at startup instead of as a
+        // confused player mid-incident.
+        //
+        // It runs at RunGame rather than in StartServerSide because the GameContent
+        // types live in VSSurvivalMod, another mod - checking too early would report
+        // its types missing purely because of load order.
+        void SelfCheck(ICoreServerAPI api)
+        {
+            var missing = new List<string>();
+
+            // API-side. EntityAgent is a compile-time reference, so this one is cheap.
+            if (typeof(EntityAgent).GetField("ignoreTeleportCall",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) == null)
+                missing.Add("EntityAgent.ignoreTeleportCall (used by /fixtl unstick and /fixtl go)");
+
+            // GameContent side, resolved BY NAME because this mod deliberately carries
+            // no VSSurvivalMod reference.
+            var teleBase = FindTypeByName("BlockEntityTeleporterBase");
+            if (teleBase == null)
+            {
+                missing.Add("type BlockEntityTeleporterBase - /fixtl diag and /fixtl go see NO teleporters at all");
+            }
+            else
+            {
+                if (FindFieldOn(teleBase, "tpingEntities") == null)
+                    missing.Add("BlockEntityTeleporterBase.tpingEntities (used by /fixtl diag)");
+                if (FindFieldOn(teleBase, "tpLocationIsOffset") == null)
+                    missing.Add("BlockEntityTeleporterBase.tpLocationIsOffset (used by /fixtl go)");
+                if (teleBase.GetMethod("GetTarget", new[] { typeof(Entity) }) == null)
+                    missing.Add("BlockEntityTeleporterBase.GetTarget(Entity) (primary destination lookup for /fixtl go)");
+            }
+
+            var statTl = FindTypeByName("BlockEntityStaticTranslocator");
+            if (statTl == null)
+                missing.Add("type BlockEntityStaticTranslocator (fallback destination lookup for /fixtl go)");
+            else if (FindFieldOn(statTl, "tpLocation") == null)
+                missing.Add("BlockEntityStaticTranslocator.tpLocation (fallback destination for /fixtl go)");
+
+            var tping = FindTypeByName("TeleportingEntity");
+            if (tping == null)
+            {
+                missing.Add("type TeleportingEntity (/fixtl diag cannot report warmup progress)");
+            }
+            else
+            {
+                if (FindFieldOn(tping, "SecondsPassed") == null)
+                    missing.Add("TeleportingEntity.SecondsPassed (used by /fixtl diag)");
+                if (FindFieldOn(tping, "LastCollideMs") == null)
+                    missing.Add("TeleportingEntity.LastCollideMs (used by /fixtl diag)");
+            }
+
+            if (missing.Count == 0)
+            {
+                api.Logger.Notification(
+                    "[lionfox_fixtl] self-check ok - all 7 reflected members resolved against this build. "
+                    + "/fixtl, status, diag, unstick and go should all function.");
+                return;
+            }
+
+            api.Logger.Warning(
+                "[lionfox_fixtl] SELF-CHECK FAILED: {0} reflected member(s) could not be resolved on this game build. "
+                + "The mod HAS LOADED and its commands will still run, but the affected ones will report a "
+                + "placeholder instead of working. Treat this as broken:", missing.Count);
+            foreach (var m in missing)
+                api.Logger.Warning("[lionfox_fixtl]   MISSING: {0}", m);
+        }
+
+        static Type? FindTypeByName(string name)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type?[] types;
+                // GetTypes() throws when ANY referenced type fails to load, and the
+                // partial result is on the exception. Swallowing that turns "three
+                // types unloadable" into "assembly empty" - the same silent
+                // degradation this self-check exists to prevent.
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException e) { types = e.Types; }
+                catch { continue; }
+
+                foreach (var t in types)
+                    if (t != null && t.Name == name) return t;
+            }
+            return null;
+        }
+
+        static FieldInfo? FindFieldOn(Type type, string name)
+        {
+            for (var t = type; t != null; t = t.BaseType)
+            {
+                var f = t.GetField(name, BindingFlags.Instance | BindingFlags.Public
+                                       | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                if (f != null) return f;
+            }
+            return null;
+        }
+
         // --- reflection helpers -------------------------------------------------
 
         static FieldInfo? FindField(object target, string name)
@@ -375,14 +500,19 @@ namespace lionfox_fixtl
             catch { return false; }
         }
 
+        // No reflection here any more. EntityAgent exposes PUBLIC Controls and
+        // ServerControls properties over the protected `controls` / `servercontrols`
+        // fields this used to reach for, and EntityControls.NoClip is a public field -
+        // verified against 1.22.6. That was three reflective lookups and three silent
+        // failure strings bought for nothing, on members with no stability contract.
+        // A rename now becomes a compile error instead of "<no controls field>" in
+        // someone's chat window.
         static string SafeNoClip(Entity e)
         {
-            var controls = FindField(e, "controls")?.GetValue(e)
-                        ?? FindField(e, "servercontrols")?.GetValue(e);
-            if (controls == null) return "<no controls field>";
-            var nc = controls.GetType().GetField("NoClip");
-            if (nc == null) return "<NoClip field missing>";
-            return nc.GetValue(controls)?.ToString() ?? "<null>";
+            if (e is not EntityAgent agent) return "<not an EntityAgent>";
+            var controls = agent.Controls ?? agent.ServerControls;
+            if (controls == null) return "<null controls>";
+            return controls.NoClip.ToString();
         }
 
         // Walk loaded chunks in a small bounding box around the entity and return
