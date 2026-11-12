@@ -4,13 +4,12 @@
     <!-- Vintage Story 1.22 runs on .NET 10; mod assemblies must match. -->
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
-    <AssemblyName>lionfox_fixtl</AssemblyName>
+    <AssemblyName>$(ModAssembly)</AssemblyName>
     <RootNamespace>lionfox_fixtl</RootNamespace>
-    <!-- Keep this in step with modinfo.json's "version". PackageMod names the
-         zip from it, and two different builds sharing one version string is a
-         real trap - it produced two distinct torchesheat_2.0.0.zip files on
-         2026-09-09 and a filename cannot tell them apart. -->
-    <Version>1.2.0</Version>
+    <!-- Read from modinfo.json (Directory.Build.props), so the two can't drift: PackageMod names the zip from it,
+         and two different builds sharing one version string is a real trap - it produced two distinct
+         torchesheat_2.0.0.zip files on 2026-09-09 and a filename cannot tell them apart. -->
+    <Version>$(ModVersion)</Version>
     <!-- The repo root IS the loadable mod folder: modinfo.json and the built DLL
          sit side by side and both are tracked. -->
     <OutputPath>../lionfox_fixtl</OutputPath>
@@ -44,6 +43,7 @@
        VSSurvivalMod reference - the self-check in StartServerSide is what makes
        that trade-off safe. -->
   <ItemGroup>
+    <Compile Remove="tests/**" />
     <Reference Include="VintagestoryAPI">
       <HintPath>$(VS_PATH)\VintagestoryAPI.dll</HintPath>
       <Private>false</Private>

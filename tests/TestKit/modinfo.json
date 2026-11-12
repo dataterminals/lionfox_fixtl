@@ -1,0 +1,14 @@
+{
+    "type": "code",
+    "modid": "lionfoxfixtltestkit",
+    "name": "lionfox fixtl test kit",
+    "description": "Test only, never ship: drives /fixtl for tests/boot_test.py.",
+    "authors": [ "lionfox" ],
+    "version": "0.1.0",
+    "side": "Server",
+    "dependencies": {
+        "game": "1.22.6",
+        "lionfoxfixtl": "*",
+        "translocatorrelocatorfork": "*"
+    }
+}

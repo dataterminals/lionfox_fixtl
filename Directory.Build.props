@@ -1,0 +1,13 @@
+<Project>
+
+  <!-- Every release names its DLL after its version, lionfox_fixtl-<modinfo version>.dll, read from modinfo.json here
+       for the mod and its tests alike. The same scheme as our client-side mods (Gearwings 0.1.6, 2026-11-06): .NET never
+       unloads a DLL, so a new build under the old assembly name can be refused in a process that already loaded the
+       old one. fixtl is server-only and the server restarts onto a release, so it hasn't hit this; it keeps the scheme
+       anyway so every lionfox mod follows one rule. -->
+  <PropertyGroup>
+    <ModVersion>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)modinfo.json')), '(?&lt;="version"\s*:\s*")[^"]+'))</ModVersion>
+    <ModAssembly>lionfox_fixtl-$(ModVersion)</ModAssembly>
+  </PropertyGroup>
+
+</Project>

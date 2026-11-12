@@ -6,15 +6,15 @@
   "compilationOptions": {},
   "targets": {
     ".NETCoreApp,Version=v10.0": {
-      "lionfox_fixtl/1.2.0": {
+      "lionfox_fixtl-1.3.0/1.3.0": {
         "runtime": {
-          "lionfox_fixtl.dll": {}
+          "lionfox_fixtl-1.3.0.dll": {}
         }
       }
     }
   },
   "libraries": {
-    "lionfox_fixtl/1.2.0": {
+    "lionfox_fixtl-1.3.0/1.3.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

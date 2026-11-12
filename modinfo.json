@@ -2,11 +2,11 @@
     "type": "code",
     "modid": "lionfoxfixtl",
     "name": "lionfox_fixtl",
-    "description": "Adds /fixtl for recovering players stuck mid-translocate. /fixtl clears the Entity.Teleporting flag. /fixtl unstick additionally clears EntityPlayer.ignoreTeleportCall (via reflection) and re-broadcasts Pos. /fixtl go bypasses BlockEntityTeleporterBase.HandleTeleportingServer entirely — finds the pad you're standing on, resolves its destination via GetTarget/tpLocation, and TeleportToDoubles you there directly (workaround for the gamemode-shift case where warmup runs but the BE loop never actually fires the teleport). /fixtl diag dumps Teleporting/IsTeleport, Pos and PreviousServerPos with the movement delta between them, MountedOn, ignoreTeleportCall, NoClip, CollisionBox, GameMode, and nearby teleporter BEs' tpingEntities entries — full report mirrored to the server log. Admin subcommands: /fixtl status, /fixtl all, /fixtl player <name>.",
+    "description": "Gets players through translocators. /fixtl checks you and the translocator you are standing in (the game's stone ones and Translocator Relocator's keyed ones), fixes what it safely can, says plainly what is wrong, and sends you through when it works. Also fixes a game bug where /gm left the server's noclip on, so translocators stopped noticing you. /fixtl check changes nothing; admins: /fixtl player, all, keys, reroll.",
     "authors": [
         "lionfox"
     ],
-    "version": "1.2.0",
+    "version": "1.3.0",
     "side": "Server",
     "dependencies": {
         "game": "1.22.0"

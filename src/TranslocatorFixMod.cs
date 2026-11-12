@@ -2,549 +2,351 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using System.Text;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
+using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
-using Vintagestory.API.Util;
 
 namespace lionfox_fixtl
 {
+    /// <summary>
+    /// /fixtl: gets a player through a translocator, or says plainly why it can't and what to do.
+    ///
+    ///   /fixtl            check you and the translocator you're at, fix what's safe, then send you through
+    ///   /fixtl check      the same checks, changing nothing
+    ///   /fixtl go         just send me where this translocator leads (after clearing my own stuck state)
+    ///   /fixtl unstick    only my own stuck state, no translocator needed
+    ///   /fixtl diag       raw state dump, also written to the server log
+    ///   /fixtl status     every online player's teleport-related state
+    ///   admin: /fixtl player NAME, /fixtl all, /fixtl keys, /fixtl reroll
+    ///
+    /// Also fixes, on its own, the game bug behind the 2026-11-07 incident (see OnSwitchGameMode).
+    /// </summary>
+    public class FixTlConfig
+    {
+        /// <summary>Re-sync the server's noclip with the player's game mode on every game-mode change (the /gm bug).</summary>
+        public bool SyncNoClipOnGameModeChange = true;
+    }
+
     public class TranslocatorFixMod : ModSystem
     {
-        ICoreServerAPI? sapi;
+        const string ConfigFile = "lionfoxfixtl.json";
+        ICoreServerAPI sapi = null!;
+        Inspector insp = null!;
+
+        /// <summary>ModConfig/lionfoxfixtl.json, written with everything on at first start. If it can't be read,
+        /// everything runs and the file is left alone.</summary>
+        public FixTlConfig Config { get; private set; } = new();
 
         public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Server;
 
-        public override void StartServerSide(ICoreServerAPI sapi)
+        public override void StartServerSide(ICoreServerAPI api)
         {
-            this.sapi = sapi;
+            sapi = api;
+            insp = new Inspector(api, this);
+            try
+            {
+                var loaded = api.LoadModConfig<FixTlConfig>(ConfigFile);
+                if (loaded == null) api.StoreModConfig(Config, ConfigFile);
+                else Config = loaded;
+            }
+            catch (Exception e)
+            {
+                api.Logger.Warning("[lionfox_fixtl] couldn't read ModConfig/{0} ({1}); running with everything on and leaving the file alone.", ConfigFile, e.Message);
+            }
+            var parsers = api.ChatCommands.Parsers;
 
-            sapi.ChatCommands.Create("fixtl")
-                .WithDescription("Clear stuck translocator state. Default action clears the Teleporting flag; use /fixtl unstick for the full force-resync that handles the gamemode-shift case.")
+            api.ChatCommands.Create("fixtl")
+                .WithDescription("Stuck at a translocator? Checks you and the translocator you're standing in, fixes what it safely can, tells you what's wrong, and sends you through when it works.")
                 .RequiresPrivilege(Privilege.chat)
-                .HandleWith(FixSelf)
-                .BeginSubCommand("status")
-                    .WithDescription("List all online players and whether their Teleporting flag is currently set.")
-                    .RequiresPrivilege(Privilege.chat)
-                    .HandleWith(Status)
-                .EndSubCommand()
-                .BeginSubCommand("diag")
-                    .WithDescription("Dump translocator-relevant state for the caller: Teleporting/IsTeleport flags, Pos and PreviousServerPos with the movement delta between them, MountedOn, ignoreTeleportCall (reflected), NoClip, and nearby teleporter block entities' tpingEntities entries.")
-                    .RequiresPrivilege(Privilege.chat)
-                    .HandleWith(Diag)
-                .EndSubCommand()
-                .BeginSubCommand("unstick")
-                    .WithDescription("Force-resync the caller: clears Teleporting + ignoreTeleportCall (via reflection) and re-runs TeleportToDouble to the entity's current Pos so clients snap. Use when warmup completed but you didn't actually move.")
-                    .RequiresPrivilege(Privilege.chat)
-                    .HandleWith(UnstickSelf)
+                // No RequiresPlayer() here: on the root it also binds every subcommand, and /fixtl player, all, keys
+                // and status must work from the console and RCON (that's how Cinder runs them). 1.3.0's first test run
+                // caught exactly that: "Caller must be player".
+                .HandleWith(a => a.Caller.Player is IServerPlayer ? Run(Self(a), apply: true, send: true, admin: null)
+                    : TextCommandResult.Error("From the console, use /fixtl player NAME."))
+                .BeginSubCommand("check")
+                    .WithDescription("The same checks as /fixtl, but changes nothing and sends you nowhere.")
+                    .RequiresPrivilege(Privilege.chat).RequiresPlayer()
+                    .HandleWith(a => Run(Self(a), apply: false, send: false, admin: null))
                 .EndSubCommand()
                 .BeginSubCommand("go")
-                    .WithDescription("Bypass the teleporter's HandleTeleportingServer loop entirely: find the translocator pad you're standing on, read its tpLocation, and TeleportToDouble there directly. Workaround when warmup runs but the server-side loop never actually fires the teleport.")
-                    .RequiresPrivilege(Privilege.chat)
-                    .HandleWith(GoSelf)
+                    .WithDescription("Clears your own stuck state and sends you straight to wherever the translocator you're standing in leads, skipping its warm-up.")
+                    .RequiresPrivilege(Privilege.chat).RequiresPlayer()
+                    .HandleWith(a => Go(Self(a)))
                 .EndSubCommand()
-                .BeginSubCommand("all")
-                    .WithDescription("Clear the stuck Teleporting flag on every online player.")
-                    .RequiresPrivilege(Privilege.controlserver)
-                    .HandleWith(FixAll)
+                .BeginSubCommand("unstick")
+                    .WithDescription("Clears only your own stuck teleport state (noclip left on, mid-teleport flags). No translocator needed.")
+                    .RequiresPrivilege(Privilege.chat).RequiresPlayer()
+                    .HandleWith(a => Unstick(Self(a)))
+                .EndSubCommand()
+                .BeginSubCommand("diag")
+                    .WithDescription("Dumps your teleport-related state and the nearby translocators' raw state; also written to the server log.")
+                    .RequiresPrivilege(Privilege.chat).RequiresPlayer()
+                    .HandleWith(a => Diag(Self(a)))
+                .EndSubCommand()
+                .BeginSubCommand("status")
+                    .WithDescription("Every online player's teleport-related state.")
+                    .RequiresPrivilege(Privilege.chat)
+                    .HandleWith(_ => Status())
                 .EndSubCommand()
                 .BeginSubCommand("player")
-                    .WithDescription("Clear the stuck flag on the named player. Usage: /fixtl player <name>")
+                    .WithDescription("Admin: run /fixtl for the named player (they see the report too, and are sent through if the translocator works).")
                     .RequiresPrivilege(Privilege.controlserver)
-                    .WithArgs(sapi.ChatCommands.Parsers.Word("playername"))
-                    .HandleWith(FixNamed)
+                    .WithArgs(parsers.Word("playername"))
+                    .HandleWith(Named)
+                .EndSubCommand()
+                .BeginSubCommand("all")
+                    .WithDescription("Admin: clear stuck teleport state (noclip left on, mid-teleport flags) on every online player.")
+                    .RequiresPrivilege(Privilege.controlserver)
+                    .HandleWith(a => All(a))
+                .EndSubCommand()
+                .BeginSubCommand("keys")
+                    .WithDescription("Admin: Translocator Relocator's keys: which translocators are alone, unkeyed, shared by 3+, or have look-alike keys.")
+                    .RequiresPrivilege(Privilege.controlserver)
+                    .HandleWith(_ => TextCommandResult.Success(string.Join("\n", insp.KeyAudit())))
+                .EndSubCommand()
+                .BeginSubCommand("reroll")
+                    .WithDescription("Admin: the stone translocator you're standing in forgets its partner and searches for a new one, like a freshly repaired one.")
+                    .RequiresPrivilege(Privilege.controlserver).RequiresPlayer()
+                    .HandleWith(a => Reroll(Self(a)))
                 .EndSubCommand();
 
-            // Deferred to RunGame: the GameContent types this checks for live in
-            // VSSurvivalMod, so checking during StartServerSide could report them
-            // missing purely because that mod has not been started yet.
-            sapi.Event.ServerRunPhase(EnumServerRunPhase.RunGame, () => SelfCheck(sapi));
+            // /gm changes the player's game mode and noclip in their world data, but not the server's copy of their
+            // controls, Entity.Controls.NoClip. Only the client's own mode-change packet syncs that one. With it left
+            // on, the server skips the player's block collisions (EntityBehaviorPlayerPhysics.HandleRemotePhysics),
+            // so no translocator ever learns they're standing in it, while their own game still plays the warm-up.
+            // 2026-11-07: /gm 3, a view-distance change (which sent that packet, so noclip went on), /gm 1: stuck.
+            api.Event.PlayerSwitchGameMode += OnSwitchGameMode;
+
+            api.Event.ServerRunPhase(EnumServerRunPhase.RunGame, SelfCheck);
         }
 
-        TextCommandResult FixSelf(TextCommandCallingArgs args)
+        void OnSwitchGameMode(IServerPlayer p)
         {
-            if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
-                return TextCommandResult.Error("No player entity to inspect.");
-
-            return ClearOne(player, "self") ?? TextCommandResult.Success(
-                "Teleporting flag was already clear. If the translocator still won't fire, try /fixtl unstick (gamemode-shift case) or /fixtl diag to inspect state.");
+            var e = p?.Entity;
+            if (e == null || !Config.SyncNoClipOnGameModeChange) return;
+            bool wd = p!.WorldData.NoClip;
+            if (e.Controls.NoClip == wd) return;
+            e.Controls.NoClip = wd;
+            sapi.Logger.Notification("[lionfox_fixtl] {0} switched to {1}: the server's noclip was still {2}; set it to {3} to match.",
+                p.PlayerName, p.WorldData.CurrentGameMode, !wd, wd);
         }
 
-        TextCommandResult FixAll(TextCommandCallingArgs args)
+        static IServerPlayer Self(TextCommandCallingArgs a) => (IServerPlayer)a.Caller.Player;
+
+        // ---- /fixtl, /fixtl check, /fixtl player -------------------------------------------------
+
+        TextCommandResult Run(IServerPlayer p, bool apply, bool send, string? admin)
         {
-            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
+            if (p.Entity == null) return TextCommandResult.Error("No player entity.");
+            var r = new Report(apply);
+            insp.CheckPlayer(p, r);
 
-            int cleared = 0;
-            int checkedCount = 0;
-            var detail = new StringBuilder();
+            var pad = insp.FindPad(p.Entity, out bool standingIn);
+            bool works = pad != null && insp.CheckPad(pad, p, r);
+            bool noclip = p.WorldData.NoClip || p.WorldData.CurrentGameMode == EnumGameMode.Spectator;
 
-            foreach (var player in sapi.World.AllOnlinePlayers.OfType<IServerPlayer>())
+            if (pad == null)
+                r.Note("No translocator within 2 blocks, so I only checked you. Stand in it and run /fixtl again.");
+            else if (works && !standingIn)
+                r.Note("Stand in the translocator and run /fixtl again to be sent through.");
+            else if (works && noclip)
+                r.Note("Not sending you while you're in spectator or noclip.");
+            else if (works && !apply)
+                r.Note("It works; /fixtl would send you through.");
+            else if (works && send)
             {
-                if (player.Entity == null) continue;
-                checkedCount++;
-                if (player.Entity.Teleporting)
-                {
-                    player.Entity.Teleporting = false;
-                    cleared++;
-                    detail.AppendLine($"  cleared: {player.PlayerName} (eid {player.Entity.EntityId})");
-                    sapi.Logger.Notification($"[lionfox_fixtl] Cleared stuck Teleporting flag on {player.PlayerName} (eid {player.Entity.EntityId}) via /fixtl all from {args.Caller.GetName()}.");
-                }
+                var t = insp.SendThrough(p, pad!, r);
+                if (t != null) r.Note($"Sending you through to {insp.Map(t.AsBlockPos)}.");
             }
 
-            string msg = $"Checked {checkedCount} online player(s), cleared {cleared} stuck Teleporting flag(s).";
-            if (cleared > 0) msg += "\n" + detail.ToString().TrimEnd();
-            return TextCommandResult.Success(msg);
+            string head = (r.Fixes, r.Problems) switch
+            {
+                (0, 0) => apply ? "/fixtl: nothing wrong that I can see." : "/fixtl check: nothing wrong that I can see.",
+                _ => apply ? "/fixtl:" : "/fixtl check (nothing changed):",
+            };
+            string text = head + "\n" + string.Join("\n", r.Lines.Select(l => "- " + l));
+            string who = admin == null ? p.PlayerName : $"{p.PlayerName} (run by {admin})";
+            foreach (var line in text.Split('\n'))
+                sapi.Logger.Notification("[lionfox_fixtl] {0}: {1}", who, line);
+            if (admin != null)
+            {
+                p.SendMessage(GlobalConstants.GeneralChatGroup, $"{admin} ran /fixtl for you.\n" + text, EnumChatType.Notification);
+                return TextCommandResult.Success($"Ran /fixtl for {p.PlayerName}; they've been told.\n" + text);
+            }
+            return TextCommandResult.Success(text);
         }
 
-        TextCommandResult FixNamed(TextCommandCallingArgs args)
+        TextCommandResult Named(TextCommandCallingArgs args)
         {
-            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
-
             string? name = args[0] as string;
-            if (string.IsNullOrWhiteSpace(name)) return TextCommandResult.Error("Usage: /fixtl player <name>");
-
-            var target = sapi.World.AllOnlinePlayers
-                .OfType<IServerPlayer>()
-                .FirstOrDefault(p => string.Equals(p.PlayerName, name, StringComparison.OrdinalIgnoreCase));
-
-            if (target == null) return TextCommandResult.Error($"No online player named '{name}'.");
-            if (target.Entity == null) return TextCommandResult.Error($"{target.PlayerName} has no entity.");
-
-            return ClearOne(target, $"admin {args.Caller.GetName()}") ?? TextCommandResult.Success($"{target.PlayerName}: flag was already clear.");
+            var p = sapi.World.AllOnlinePlayers.OfType<IServerPlayer>()
+                .FirstOrDefault(x => string.Equals(x.PlayerName, name, StringComparison.OrdinalIgnoreCase));
+            if (p?.Entity == null) return TextCommandResult.Error($"No online player named '{name}'.");
+            return Run(p, apply: true, send: true, admin: args.Caller.GetName());
         }
 
-        TextCommandResult Status(TextCommandCallingArgs args)
-        {
-            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
+        // ---- /fixtl go, unstick, all, status, reroll ---------------------------------------------
 
+        TextCommandResult Go(IServerPlayer p)
+        {
+            var r = new Report(true);
+            insp.CheckPlayer(p, r);
+            var pad = insp.FindPad(p.Entity, out _);
+            if (pad == null) return TextCommandResult.Error("No translocator within 2 blocks. Stand in one and try again.");
+            var t = insp.SendThrough(p, pad, r);
+            r.Note(t != null ? $"Sending you to {insp.Map(t.AsBlockPos)}." : "Nowhere to send you; /fixtl says why.");
+            return TextCommandResult.Success("/fixtl go:\n" + string.Join("\n", r.Lines.Select(l => "- " + l)));
+        }
+
+        TextCommandResult Unstick(IServerPlayer p)
+        {
+            var r = new Report(true);
+            insp.CheckPlayer(p, r);
+            if (r.Lines.Count == 0) r.Note("Nothing stuck on you.");
+            return TextCommandResult.Success("/fixtl unstick:\n" + string.Join("\n", r.Lines.Select(l => "- " + l)));
+        }
+
+        TextCommandResult All(TextCommandCallingArgs args)
+        {
             var sb = new StringBuilder();
-            int stuck = 0;
-            int total = 0;
-            foreach (var player in sapi.World.AllOnlinePlayers.OfType<IServerPlayer>())
+            int n = 0, fixedPlayers = 0;
+            foreach (var p in sapi.World.AllOnlinePlayers.OfType<IServerPlayer>())
             {
-                if (player.Entity == null) continue;
-                total++;
-                bool flag = player.Entity.Teleporting;
-                if (flag) stuck++;
-                sb.AppendLine($"  {player.PlayerName} (eid {player.Entity.EntityId}): Teleporting={flag}");
+                if (p.Entity == null) continue;
+                n++;
+                var r = new Report(true);
+                insp.CheckPlayer(p, r);
+                if (r.Fixes == 0) continue;
+                fixedPlayers++;
+                sb.AppendLine($"{p.PlayerName}:");
+                foreach (var l in r.Lines) sb.AppendLine("  " + l);
             }
-            sb.Insert(0, $"Status: {stuck}/{total} online player(s) have Teleporting=true.\n");
-            return TextCommandResult.Success(sb.ToString().TrimEnd());
+            sapi.Logger.Notification("[lionfox_fixtl] /fixtl all by {0}: {1} of {2} player(s) needed fixing.", args.Caller.GetName(), fixedPlayers, n);
+            return TextCommandResult.Success($"Checked {n} online player(s); {fixedPlayers} needed fixing.\n" + sb.ToString().TrimEnd());
         }
 
-        TextCommandResult? ClearOne(IServerPlayer player, string source)
+        TextCommandResult Status()
         {
-            if (sapi == null) return null;
-            if (!player.Entity.Teleporting) return null;
-
-            player.Entity.Teleporting = false;
-            sapi.Logger.Notification($"[lionfox_fixtl] Cleared stuck Teleporting flag on {player.PlayerName} (eid {player.Entity.EntityId}) via /fixtl ({source}).");
-            return TextCommandResult.Success($"Cleared stuck Teleporting flag on {player.PlayerName}. Try a translocator now.");
+            var sb = new StringBuilder();
+            foreach (var p in sapi.World.AllOnlinePlayers.OfType<IServerPlayer>())
+            {
+                var e = p.Entity;
+                if (e == null) continue;
+                bool ignore = R.Get<bool>(R.IgnoreTeleportCall, e);
+                sb.AppendLine($"{p.PlayerName}: {p.WorldData.CurrentGameMode}, noclip {p.WorldData.NoClip} (server's copy {e.Controls.NoClip}"
+                    + $"{(e.Controls.NoClip != p.WorldData.NoClip ? ", OUT OF STEP" : "")}), mid-teleport {e.Teleporting}, ignoring teleports {ignore}");
+            }
+            return TextCommandResult.Success(sb.Length == 0 ? "Nobody online." : sb.ToString().TrimEnd());
         }
 
-        // --- diag ---------------------------------------------------------------
-
-        TextCommandResult Diag(TextCommandCallingArgs args)
+        TextCommandResult Reroll(IServerPlayer p)
         {
-            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
-            if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
-                return TextCommandResult.Error("No player entity to inspect.");
+            var pad = insp.FindPad(p.Entity, out _);
+            if (pad == null || !R.IsStatic(pad)) return TextCommandResult.Error("Stand in a repaired stone translocator first.");
+            return insp.Reroll(pad, out string msg) ? TextCommandResult.Success(msg) : TextCommandResult.Error(msg);
+        }
 
+        // ---- a search that may never answer -------------------------------------------------------
+
+        readonly Dictionary<BlockPos, long> stalledSince = new();
+        readonly Dictionary<BlockPos, string?> stalledWatch = new();
+
+        internal long StalledSince(BlockPos pos, IServerPlayer? by)
+        {
+            if (!stalledSince.TryGetValue(pos, out long t)) stalledSince[pos.Copy()] = t = sapi.World.ElapsedMilliseconds;
+            return t;
+        }
+
+        internal void ForgetStalled(BlockPos pos)
+        {
+            stalledSince.Remove(pos);
+            stalledWatch.Remove(pos);
+        }
+
+        /// <summary>Looks again once two minutes have passed since it was first seen waiting; restarts the search if
+        /// it's still waiting, and tells whoever asked.</summary>
+        internal void WatchStalled(BlockPos pos, IServerPlayer? by)
+        {
+            if (stalledWatch.ContainsKey(pos)) return;
+            var at = pos.Copy();
+            stalledWatch[at] = by?.PlayerUID;
+            long wait = Math.Max(1000, stalledSince[at] + 121_000 - sapi.World.ElapsedMilliseconds);
+            sapi.Event.RegisterCallback(_ =>
+            {
+                stalledWatch.TryGetValue(at, out string? uid);
+                stalledWatch.Remove(at);
+                var be = sapi.World.BlockAccessor.GetBlockEntity(at);
+                if (!R.IsStatic(be)) { ForgetStalled(at); return; }
+                var r = new Report(true);
+                insp.CheckPad(be!, null, r);
+                var who = uid == null ? null : sapi.World.PlayerByUid(uid) as IServerPlayer;
+                if (who?.ConnectionState == EnumClientState.Playing && r.Lines.Count > 0)
+                    who.SendMessage(GlobalConstants.GeneralChatGroup, "/fixtl, two minutes later:\n" + string.Join("\n", r.Lines.Select(l => "- " + l)), EnumChatType.Notification);
+            }, (int)wait);
+        }
+
+        // ---- /fixtl diag ---------------------------------------------------------------------------
+
+        TextCommandResult Diag(IServerPlayer player)
+        {
             var e = player.Entity;
             var sb = new StringBuilder();
             sb.AppendLine($"=== /fixtl diag for {player.PlayerName} (eid {e.EntityId}) ===");
-            sb.AppendLine($"Teleporting       : {e.Teleporting}");
-            sb.AppendLine($"IsTeleport        : {e.IsTeleport}");
-            sb.AppendLine($"MountedOn         : {(e.MountedOn?.Entity?.GetType().Name ?? "<none>")}");
-            sb.AppendLine($"Pos               : {e.Pos.X:F2}, {e.Pos.Y:F2}, {e.Pos.Z:F2}");
-            // The old "ServerPos" line and the |Pos-ServerPos| delta are GONE, not
-            // ported. On 1.22 Entity.ServerPos and Entity.SidedPos are both obsolete
-            // shims marked "Use Pos instead" - the three have been collapsed onto one
-            // property. Printing ServerPos would restate Pos, and the delta would be a
-            // hard 0.00 every single time.
-            //
-            // That is worse than removing it. This is a diagnostic somebody reads while
-            // a player is stuck in a translocator, and a field that always reads 0.00
-            // looks like PROOF the position is synced rather than proof the measurement
-            // is dead. PreviousServerPos is NOT obsolete and is still a distinct value,
-            // so the movement-since-last-tick delta below carries real information.
-            sb.AppendLine($"PreviousServerPos : {e.PreviousServerPos.X:F2}, {e.PreviousServerPos.Y:F2}, {e.PreviousServerPos.Z:F2}");
-            double dx = e.Pos.X - e.PreviousServerPos.X;
-            double dy = e.Pos.Y - e.PreviousServerPos.Y;
-            double dz = e.Pos.Z - e.PreviousServerPos.Z;
-            sb.AppendLine($"|Pos-PrevServer|  : {Math.Sqrt(dx * dx + dy * dy + dz * dz):F2} blocks (movement since last sync)");
-            sb.AppendLine($"Motion            : {e.Pos.Motion.X:F3}, {e.Pos.Motion.Y:F3}, {e.Pos.Motion.Z:F3}");
-
-            var ignoreVal = TryReadField<bool>(e, "ignoreTeleportCall", out bool ignoreOk);
-            sb.AppendLine($"ignoreTeleportCall: {(ignoreOk ? ignoreVal.ToString() : "<field not found>")}");
-
-            sb.AppendLine($"GameMode          : {player.WorldData?.CurrentGameMode}");
-            sb.AppendLine($"NoClip (controls) : {SafeNoClip(e)}");
+            sb.AppendLine($"GameMode {player.WorldData.CurrentGameMode}; noclip: world data {player.WorldData.NoClip}, server controls {e.Controls.NoClip}");
+            sb.AppendLine($"Teleporting {e.Teleporting}, IsTeleport {e.IsTeleport}, ignoreTeleportCall {(R.IgnoreTeleportCall == null ? "<missing>" : R.Get<bool>(R.IgnoreTeleportCall, e).ToString())}");
+            sb.AppendLine($"MountedOn {(e.MountedOn?.Entity?.Code?.ToString() ?? (e.MountedOn != null ? "<seat>" : "<none>"))}");
+            sb.AppendLine($"Pos {e.Pos.X:F2}, {e.Pos.Y:F2}, {e.Pos.Z:F2} (map {insp.Map(e.Pos.AsBlockPos)})");
             var cb = e.CollisionBox;
-            sb.AppendLine($"CollisionBox      : ({cb?.X1:F2},{cb?.Y1:F2},{cb?.Z1:F2}) -> ({cb?.X2:F2},{cb?.Y2:F2},{cb?.Z2:F2})  size {(cb?.X2 - cb?.X1):F2}x{(cb?.Y2 - cb?.Y1):F2}x{(cb?.Z2 - cb?.Z1):F2}");
+            sb.AppendLine($"CollisionBox ({cb?.X1:F2},{cb?.Y1:F2},{cb?.Z1:F2}) -> ({cb?.X2:F2},{cb?.Y2:F2},{cb?.Z2:F2})");
 
-            int nearbyBe = 0;
-            int containsSelf = 0;
-            var beDetail = new StringBuilder();
-            foreach (var (be, dist) in NearbyTeleporterBEs(e, radius: 6))
+            foreach (var be in insp.TeleportersNear(e.Pos.AsBlockPos, 6).OrderBy(b => e.Pos.XYZ.DistanceTo(b.Pos.ToVec3d().Add(0.5, 0, 0.5))))
             {
-                nearbyBe++;
-                var dict = TryReadField<IDictionary>(be, "tpingEntities", out bool dictOk);
-                if (!dictOk || dict == null)
+                sb.Append($"{be.GetType().Name} @ {be.Pos} (map {insp.Map(be.Pos)})");
+                if (R.IsStatic(be))
+                    sb.Append($": state {be.Block?.Variant?["state"]}, repair {R.Get<int>(R.StRepairState, be)}/{R.Get<int>(R.StRequired, be)}, canTeleport {R.Get<bool>(R.StCanTeleport, be)}, findNextChunk {R.Get<bool>(R.StFindNextChunk, be)}, tpLocation {R.Get<BlockPos>(R.StTpLocation, be)?.ToString() ?? "null"}");
+                if (R.IsReloc(be))
                 {
-                    beDetail.AppendLine($"  {be.GetType().Name} @ {be.Pos} (dist {dist:F1}): <tpingEntities unreadable>");
-                    continue;
+                    var reg = R.Registry();
+                    string listed = reg == null ? "<unreadable>" : reg.TryGetValue(be.Pos, out string? k) ? $"\"{k}\"" : "<not listed>";
+                    int partners = reg?.Count(kv => kv.Value == R.LinkKey(be) && !(kv.Key.X == be.Pos.X && kv.Key.Y == be.Pos.Y && kv.Key.Z == be.Pos.Z)) ?? -1;
+                    sb.Append($": key \"{R.LinkKey(be)}\", listed as {listed}, {partners} other(s) listed under its key");
                 }
-
-                bool selfInDict = false;
-                var entries = new List<string>();
-                foreach (DictionaryEntry kv in dict)
+                sb.AppendLine();
+                var d = R.Tping(be);
+                if (d == null) continue;
+                foreach (DictionaryEntry kv in d)
                 {
-                    long eid = (long)kv.Key;
-                    var val = kv.Value;
-                    float secondsPassed = TryReadFieldDirect<float>(val, "SecondsPassed");
-                    long lastCollideMs = TryReadFieldDirect<long>(val, "LastCollideMs");
-                    long sinceMs = sapi.World.ElapsedMilliseconds - lastCollideMs;
-                    entries.Add($"eid={eid} secondsPassed={secondsPassed:F2} sinceCollide={sinceMs}ms");
-                    if (eid == e.EntityId) selfInDict = true;
+                    var ent = R.Get<Entity>(R.TeEntity, kv.Value);
+                    long since = sapi.World.ElapsedMilliseconds - R.Get<long>(R.TeLastCollideMs, kv.Value);
+                    sb.AppendLine($"  warming up: eid {kv.Key}{(ReferenceEquals(ent, e) ? " (you)" : ent?.EntityId == e.EntityId ? " (an OLD copy of you)" : "")}, {R.Get<float>(R.TeSecondsPassed, kv.Value):F2} s, last touched {since} ms ago");
                 }
-                if (selfInDict) containsSelf++;
-
-                beDetail.AppendLine($"  {be.GetType().Name} @ {be.Pos} (dist {dist:F1}, {dict.Count} entries{(selfInDict ? ", SELF" : "")}):");
-                foreach (var s in entries) beDetail.AppendLine($"    {s}");
             }
-
-            sb.AppendLine($"Nearby teleporter BEs (r=6): {nearbyBe}, containing self: {containsSelf}");
-            if (nearbyBe > 0) sb.Append(beDetail.ToString().TrimEnd());
-
             string report = sb.ToString().TrimEnd();
-            // Mirror to server log so it can't be lost to chat scrollback/truncation.
-            foreach (var line in report.Split('\n'))
-                sapi.Logger.Notification("[lionfox_fixtl] " + line.TrimEnd('\r'));
-            return TextCommandResult.Success(report + "\n(Full report also written to server log.)");
+            foreach (var line in report.Split('\n')) sapi.Logger.Notification("[lionfox_fixtl] " + line.TrimEnd('\r'));
+            return TextCommandResult.Success(report + "\n(Also written to the server log.)");
         }
 
-        // --- unstick ------------------------------------------------------------
+        // ---- startup self-check -----------------------------------------------------------------
 
-        TextCommandResult UnstickSelf(TextCommandCallingArgs args)
+        // Every reflected member degrades to "not checked" rather than throwing, which is right for a recovery
+        // command but means a renamed member would make a mod that loads clean and quietly fixes nobody. So resolve
+        // them all once at RunGame (GameContent and Translocator Relocator are other mods, started before then) and
+        // say so loudly in the log.
+        void SelfCheck()
         {
-            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
-            if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
-                return TextCommandResult.Error("No player entity to inspect.");
-
-            var e = player.Entity;
-            var actions = new List<string>();
-
-            if (e.Teleporting)
-            {
-                e.Teleporting = false;
-                actions.Add("cleared Teleporting=true");
-            }
-
-            var priorIgnore = TryReadField<bool>(e, "ignoreTeleportCall", out bool ignoreReadable);
-            if (TryWriteField(e, "ignoreTeleportCall", false, out _))
-            {
-                actions.Add($"ignoreTeleportCall: prior={(ignoreReadable ? priorIgnore.ToString() : "?")} -> false");
-            }
-            else
-            {
-                actions.Add("ignoreTeleportCall: <field not writable>");
-            }
-
-            // Was e.ServerPos - obsolete on 1.22 ("Use Pos instead"), and Pos IS the
-            // authoritative server-side position here, so the semantics are unchanged.
-            double x = e.Pos.X, y = e.Pos.Y, z = e.Pos.Z;
-            try
-            {
-                e.TeleportToDouble(x, y, z);
-                actions.Add($"re-broadcast position via TeleportToDouble({x:F2},{y:F2},{z:F2})");
-            }
-            catch (Exception ex)
-            {
-                actions.Add($"TeleportToDouble threw: {ex.GetType().Name}: {ex.Message}");
-            }
-
-            string summary = string.Join("; ", actions);
-            sapi.Logger.Notification($"[lionfox_fixtl] /fixtl unstick for {player.PlayerName} (eid {e.EntityId}): {summary}");
-            return TextCommandResult.Success($"Force-resync done: {summary}\nIf you still can't translocate, step off the pad and back on.");
-        }
-
-        // --- go: bypass HandleTeleportingServer by teleporting straight to the pad's target
-
-        TextCommandResult GoSelf(TextCommandCallingArgs args)
-        {
-            if (sapi == null) return TextCommandResult.Error("Server API unavailable.");
-            if (args.Caller.Player is not IServerPlayer player || player.Entity == null)
-                return TextCommandResult.Error("No player entity to inspect.");
-
-            var e = player.Entity;
-            BlockEntity? pad = null;
-            double padDist = double.MaxValue;
-            foreach (var (be, dist) in NearbyTeleporterBEs(e, radius: 2))
-            {
-                if (dist < padDist) { pad = be; padDist = dist; }
-            }
-            if (pad == null) return TextCommandResult.Error("No translocator pad within 2 blocks. Stand on one and try again.");
-
-            // Resolve destination. Prefer calling GetTarget(entity) on the actual subclass
-            // (e.g. BlockEntityStaticTranslocator returns tpLocation + (-0.3, 1, -0.3)).
-            Vec3d? target = null;
-            string targetSource;
-            try
-            {
-                var getTarget = pad.GetType().GetMethod("GetTarget", new[] { typeof(Entity) });
-                if (getTarget != null)
-                {
-                    target = getTarget.Invoke(pad, new object[] { e }) as Vec3d;
-                    targetSource = "GetTarget(entity)";
-                }
-                else
-                {
-                    targetSource = "<GetTarget missing>";
-                }
-            }
-            catch (Exception ex)
-            {
-                targetSource = $"<GetTarget threw {ex.GetType().Name}>";
-            }
-
-            if (target == null)
-            {
-                // Fallback: read tpLocation field directly.
-                var tpLoc = TryReadField<BlockPos>(pad, "tpLocation", out bool tpOk);
-                if (tpOk && tpLoc != null)
-                {
-                    target = new Vec3d(tpLoc.X - 0.3, tpLoc.Y + 1.0, tpLoc.Z - 0.3);
-                    targetSource = "tpLocation field";
-                }
-            }
-
-            if (target == null)
-                return TextCommandResult.Error($"Pad {pad.GetType().Name} @ {pad.Pos} has no resolvable destination (source: {targetSource}). Pair may not have been discovered yet.");
-
-            // Apply offset if the BE uses pad-relative target coords.
-            var isOffset = TryReadField<bool>(pad, "tpLocationIsOffset", out bool _);
-            if (isOffset) target = target.Clone().Add(pad.Pos.X, pad.Pos.Y, pad.Pos.Z);
-
-            // Defensive: clear ignoreTeleportCall so TeleportToDouble actually runs.
-            TryWriteField(e, "ignoreTeleportCall", false, out _);
-            e.Teleporting = false;
-
-            try
-            {
-                e.TeleportToDouble(target.X, target.Y, target.Z);
-            }
-            catch (Exception ex)
-            {
-                sapi.Logger.Error($"[lionfox_fixtl] /fixtl go TeleportToDouble threw for {player.PlayerName}: {ex}");
-                return TextCommandResult.Error($"TeleportToDouble threw: {ex.GetType().Name}: {ex.Message}");
-            }
-
-            sapi.Logger.Notification($"[lionfox_fixtl] /fixtl go for {player.PlayerName} (eid {e.EntityId}): pad {pad.GetType().Name} @ {pad.Pos} -> ({target.X:F2},{target.Y:F2},{target.Z:F2}) via {targetSource}");
-            return TextCommandResult.Success($"Bypassed BE loop: teleported to ({target.X:F2}, {target.Y:F2}, {target.Z:F2}) via {targetSource} on {pad.GetType().Name}.");
-        }
-
-        // --- startup self-check -------------------------------------------------
-
-        // WHY THIS EXISTS. Every reflective lookup below is individually guarded and
-        // degrades to a placeholder string rather than throwing: "<field not found>",
-        // "<GetTarget missing>", "<tpingEntities unreadable>". That is the right
-        // behaviour for a recovery command - but it means a renamed member produces a
-        // mod that loads clean, reports healthy, and silently fixes nobody. The first
-        // evidence would be a player stuck in a translocator who cannot be unstuck,
-        // which is the worst possible moment to discover it.
-        //
-        // So resolve everything once, up front, and say so loudly. This does not fix a
-        // break; it makes the break arrive as a log line at startup instead of as a
-        // confused player mid-incident.
-        //
-        // It runs at RunGame rather than in StartServerSide because the GameContent
-        // types live in VSSurvivalMod, another mod - checking too early would report
-        // its types missing purely because of load order.
-        void SelfCheck(ICoreServerAPI api)
-        {
-            var missing = new List<string>();
-
-            // API-side. EntityAgent is a compile-time reference, so this one is cheap.
-            if (typeof(EntityAgent).GetField("ignoreTeleportCall",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) == null)
-                missing.Add("EntityAgent.ignoreTeleportCall (used by /fixtl unstick and /fixtl go)");
-
-            // GameContent side, resolved BY NAME because this mod deliberately carries
-            // no VSSurvivalMod reference.
-            var teleBase = FindTypeByName("BlockEntityTeleporterBase");
-            if (teleBase == null)
-            {
-                missing.Add("type BlockEntityTeleporterBase - /fixtl diag and /fixtl go see NO teleporters at all");
-            }
-            else
-            {
-                if (FindFieldOn(teleBase, "tpingEntities") == null)
-                    missing.Add("BlockEntityTeleporterBase.tpingEntities (used by /fixtl diag)");
-                if (FindFieldOn(teleBase, "tpLocationIsOffset") == null)
-                    missing.Add("BlockEntityTeleporterBase.tpLocationIsOffset (used by /fixtl go)");
-                if (teleBase.GetMethod("GetTarget", new[] { typeof(Entity) }) == null)
-                    missing.Add("BlockEntityTeleporterBase.GetTarget(Entity) (primary destination lookup for /fixtl go)");
-            }
-
-            var statTl = FindTypeByName("BlockEntityStaticTranslocator");
-            if (statTl == null)
-                missing.Add("type BlockEntityStaticTranslocator (fallback destination lookup for /fixtl go)");
-            else if (FindFieldOn(statTl, "tpLocation") == null)
-                missing.Add("BlockEntityStaticTranslocator.tpLocation (fallback destination for /fixtl go)");
-
-            var tping = FindTypeByName("TeleportingEntity");
-            if (tping == null)
-            {
-                missing.Add("type TeleportingEntity (/fixtl diag cannot report warmup progress)");
-            }
-            else
-            {
-                if (FindFieldOn(tping, "SecondsPassed") == null)
-                    missing.Add("TeleportingEntity.SecondsPassed (used by /fixtl diag)");
-                if (FindFieldOn(tping, "LastCollideMs") == null)
-                    missing.Add("TeleportingEntity.LastCollideMs (used by /fixtl diag)");
-            }
-
+            var missing = R.Resolve();
             if (missing.Count == 0)
             {
-                api.Logger.Notification(
-                    "[lionfox_fixtl] self-check ok - all 7 reflected members resolved against this build. "
-                    + "/fixtl, status, diag, unstick and go should all function.");
+                sapi.Logger.Notification("[lionfox_fixtl] self-check ok: every reflected member resolved on this build; Translocator Relocator {0}; noclip re-sync on game-mode change {1}.",
+                    R.RelocatorLoaded ? "found, so keyed translocators are checked too" : "not installed, so only the game's own translocators are checked",
+                    Config.SyncNoClipOnGameModeChange ? "on" : "OFF (ModConfig)");
                 return;
             }
-
-            api.Logger.Warning(
-                "[lionfox_fixtl] SELF-CHECK FAILED: {0} reflected member(s) could not be resolved on this game build. "
-                + "The mod HAS LOADED and its commands will still run, but the affected ones will report a "
-                + "placeholder instead of working. Treat this as broken:", missing.Count);
-            foreach (var m in missing)
-                api.Logger.Warning("[lionfox_fixtl]   MISSING: {0}", m);
-        }
-
-        static Type? FindTypeByName(string name)
-        {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                Type?[] types;
-                // GetTypes() throws when ANY referenced type fails to load, and the
-                // partial result is on the exception. Swallowing that turns "three
-                // types unloadable" into "assembly empty" - the same silent
-                // degradation this self-check exists to prevent.
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException e) { types = e.Types; }
-                catch { continue; }
-
-                foreach (var t in types)
-                    if (t != null && t.Name == name) return t;
-            }
-            return null;
-        }
-
-        static FieldInfo? FindFieldOn(Type type, string name)
-        {
-            for (var t = type; t != null; t = t.BaseType)
-            {
-                var f = t.GetField(name, BindingFlags.Instance | BindingFlags.Public
-                                       | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
-                if (f != null) return f;
-            }
-            return null;
-        }
-
-        // --- reflection helpers -------------------------------------------------
-
-        static FieldInfo? FindField(object target, string name)
-        {
-            var t = target.GetType();
-            while (t != null)
-            {
-                var f = t.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (f != null) return f;
-                t = t.BaseType;
-            }
-            return null;
-        }
-
-        static T? TryReadField<T>(object target, string name, out bool ok)
-        {
-            var f = FindField(target, name);
-            if (f == null) { ok = false; return default; }
-            try { ok = true; return (T?)f.GetValue(target); }
-            catch { ok = false; return default; }
-        }
-
-        static T TryReadFieldDirect<T>(object? target, string name)
-        {
-            if (target == null) return default!;
-            var f = FindField(target, name);
-            if (f == null) return default!;
-            try { return (T)f.GetValue(target)!; } catch { return default!; }
-        }
-
-        static bool TryWriteField(object target, string name, object? value, out bool previousValueWasTruthy)
-        {
-            previousValueWasTruthy = false;
-            var f = FindField(target, name);
-            if (f == null) return false;
-            try
-            {
-                var prev = f.GetValue(target);
-                previousValueWasTruthy = prev is bool b && b;
-                f.SetValue(target, value);
-                return true;
-            }
-            catch { return false; }
-        }
-
-        // No reflection here any more. EntityAgent exposes PUBLIC Controls and
-        // ServerControls properties over the protected `controls` / `servercontrols`
-        // fields this used to reach for, and EntityControls.NoClip is a public field -
-        // verified against 1.22.6. That was three reflective lookups and three silent
-        // failure strings bought for nothing, on members with no stability contract.
-        // A rename now becomes a compile error instead of "<no controls field>" in
-        // someone's chat window.
-        static string SafeNoClip(Entity e)
-        {
-            if (e is not EntityAgent agent) return "<not an EntityAgent>";
-            var controls = agent.Controls ?? agent.ServerControls;
-            if (controls == null) return "<null controls>";
-            return controls.NoClip.ToString();
-        }
-
-        // Walk loaded chunks in a small bounding box around the entity and return
-        // BlockEntities that derive from BlockEntityTeleporterBase. We match by
-        // type name to avoid a hard reference on VSSurvivalMod.
-        IEnumerable<(BlockEntity be, double dist)> NearbyTeleporterBEs(Entity e, int radius)
-        {
-            if (sapi == null) yield break;
-            var origin = e.Pos.XYZ;
-            var min = new BlockPos((int)origin.X - radius, Math.Max(0, (int)origin.Y - radius), (int)origin.Z - radius);
-            var max = new BlockPos((int)origin.X + radius, (int)origin.Y + radius, (int)origin.Z + radius);
-
-            var found = new List<(BlockEntity, double)>();
-            sapi.World.BlockAccessor.WalkBlocks(min, max, (block, x, y, z) =>
-            {
-                var be = sapi.World.BlockAccessor.GetBlockEntity(new BlockPos(x, y, z));
-                if (be == null) return;
-                if (!IsTeleporterBE(be)) return;
-                double d = origin.DistanceTo(new Vec3d(x + 0.5, y + 0.5, z + 0.5));
-                found.Add((be, d));
-            }, centerOrder: true);
-
-            foreach (var x in found.OrderBy(t => t.Item2)) yield return x;
-        }
-
-        static bool IsTeleporterBE(BlockEntity be)
-        {
-            for (var t = be.GetType(); t != null; t = t.BaseType)
-            {
-                if (t.Name == "BlockEntityTeleporterBase") return true;
-            }
-            return false;
+            sapi.Logger.Warning("[lionfox_fixtl] SELF-CHECK FAILED: {0} member(s) didn't resolve on this build. /fixtl still runs, but skips what these cover:", missing.Count);
+            foreach (var m in missing) sapi.Logger.Warning("[lionfox_fixtl]   MISSING: {0}", m);
         }
     }
 }

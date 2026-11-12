@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Test-only companion mod (see FixtlTestKit.cs). Builds into tests/TestKit/bin/lionfoxfixtltestkit, a loadable
+       mod folder for tests/boot_test.py. Never ship it. The main csproj leaves tests/ out. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>lionfox_FixtlTestKit</AssemblyName>
+    <RootNamespace>lionfox_fixtl.TestKit</RootNamespace>
+    <OutputPath>bin/lionfoxfixtltestkit</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <VS_PATH Condition="'$(VS_PATH)' == ''">$(VINTAGE_STORY)</VS_PATH>
+    <VS_PATH Condition="'$(VS_PATH)' == '' And Exists('D:\Vintagestory\VintagestoryAPI.dll')">D:\Vintagestory</VS_PATH>
+    <VS_PATH Condition="'$(VS_PATH)' == '' And Exists('H:\Vintagestory\VintagestoryAPI.dll')">H:\Vintagestory</VS_PATH>
+    <!-- Translocator Relocator's DLL, from the zip in tests/deps (unpacked by the build below). -->
+    <RelocDir>$(MSBuildThisFileDirectory)obj\reloc</RelocDir>
+  </PropertyGroup>
+
+  <Target Name="UnpackRelocator" BeforeTargets="ResolveAssemblyReferences" Condition="!Exists('$(RelocDir)\TranslocatorRelocator.dll')">
+    <Unzip SourceFiles="$(MSBuildThisFileDirectory)..\deps\TranslocatorRelocatorFork_1.0.5.zip" DestinationFolder="$(RelocDir)" />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI"><HintPath>$(VS_PATH)\VintagestoryAPI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VSEssentials"><HintPath>$(VS_PATH)\Mods\VSEssentials.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VSSurvivalMod"><HintPath>$(VS_PATH)\Mods\VSSurvivalMod.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="TranslocatorRelocator"><HintPath>$(RelocDir)\TranslocatorRelocator.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="protobuf-net"><HintPath>$(VS_PATH)\Lib\protobuf-net.dll</HintPath><Private>false</Private></Reference>
+    <None Include="modinfo.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
